@@ -15,7 +15,7 @@ use std::{
 use tokio::sync::broadcast;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-mod constants;
+mod consts;
 
 struct AppState {
     user_set: Mutex<HashMap<String, broadcast::Sender<String>>>,
@@ -64,7 +64,13 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>) {
         if let Message::Text(name) = message {
             check_username(&state, &mut username, &name);
 
-            if username.is_empty() {
+            if username == consts::GLOBAL_CHAT_NAME {
+                let _ = sender
+                    .send(Message::Text(String::from("This word is reserved.")))
+                    .await;
+
+                return;
+            } else if username.is_empty() {
                 let _ = sender
                     .send(Message::Text(String::from("Username already taken.")))
                     .await;
@@ -110,11 +116,11 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>) {
         while let Some(Ok(Message::Text(text))) = receiver.next().await {
             let (recipient, message) = parse_ws_message(text);
 
-            if recipient == constants::GLOBAL {
-                let global = constants::GLOBAL;
+            if recipient == consts::GLOBAL_CHAT_NAME {
+                let global = consts::GLOBAL_CHAT_NAME;
                 let _ = global_state
                     .tx
-                    .send(format!("{username}->{global}: {message}"));
+                    .send(format!("{global}{username}: {message}"));
             } else if let Some(recipient_tx) = user_set_state
                 .user_set
                 .lock()
@@ -126,7 +132,9 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>) {
                 let _ = recipient_tx.send(recipient_message.clone());
                 let _ = tx.send(recipient_message);
             } else {
-                let _ = tx.send(format!("Recipient with username \"{recipient}\" not found"));
+                let _ = tx.send(format!(
+                    "Recipient with username \"{recipient}\" not found."
+                ));
             }
         }
     });
@@ -144,7 +152,7 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>) {
 }
 
 fn parse_ws_message(ws_message: String) -> (String, String) {
-    let mut recipient = String::from(constants::GLOBAL);
+    let mut recipient = String::from(consts::GLOBAL_CHAT_NAME);
     let mut message = ws_message.clone().to_string();
 
     if ws_message.contains(':') {
