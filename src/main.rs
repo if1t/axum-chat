@@ -15,6 +15,8 @@ use std::{
 use tokio::sync::broadcast;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+mod constants;
+
 struct AppState {
     user_set: Mutex<HashMap<String, broadcast::Sender<String>>>,
     tx: broadcast::Sender<String>,
@@ -31,7 +33,7 @@ async fn main() {
         .init();
 
     let user_set = Mutex::new(HashMap::new());
-    let (tx, _rx) = broadcast::channel(100);
+    let (tx, _) = broadcast::channel(100);
 
     let app_state = Arc::new(AppState { user_set, tx });
 
@@ -62,19 +64,17 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>) {
         if let Message::Text(name) = message {
             check_username(&state, &mut username, &name);
 
-            if !username.is_empty() {
-                break;
-            } else {
+            if username.is_empty() {
                 let _ = sender
                     .send(Message::Text(String::from("Username already taken.")))
                     .await;
 
                 return;
+            } else {
+                break;
             }
         }
     }
-
-    let username_clone = username.clone(); // Clone username here
 
     let (tx, mut rx) = broadcast::channel(100);
     state
@@ -83,31 +83,50 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>) {
         .unwrap()
         .insert(username.clone(), tx.clone());
 
+    let username_clone = username.clone();
+
     let msg = format!("{username_clone} joined.");
     tracing::debug!("{msg}");
-    let _ = state.tx.send(msg); // Send join message to general chat
-    let state_clone = state.clone(); // Clone state here
+    let _ = state.tx.send(msg);
+    let common_state = state.clone();
     let mut send_task = tokio::spawn(async move {
-        while let Ok(msg) = rx.recv().await {
-            if sender.send(Message::Text(msg)).await.is_err() {
+        let mut common_rx = common_state.tx.subscribe();
+
+        loop {
+            let msg = tokio::select! {
+                msg = rx.recv() => msg,
+                msg = common_rx.recv() => msg,
+            };
+
+            if sender.send(Message::Text(msg.unwrap())).await.is_err() {
                 break;
             }
         }
     });
 
+    let global_state = state.clone();
+    let user_set_state = state.clone();
     let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(Message::Text(text))) = receiver.next().await {
-            let mut parts = text.splitn(2, ':');
-            let recipient = parts.next().unwrap().trim();
-            let message = parts.next().unwrap().trim();
+            let (recipient, message) = parse_ws_message(text);
 
-            // Send message to recipient
-            if let Some(recipient_tx) = state_clone.user_set.lock().unwrap().get(recipient).cloned()
+            if recipient == constants::GLOBAL {
+                let global = constants::GLOBAL;
+                let _ = global_state
+                    .tx
+                    .send(format!("{username}->{global}: {message}"));
+            } else if let Some(recipient_tx) = user_set_state
+                .user_set
+                .lock()
+                .unwrap()
+                .get(recipient.as_str())
+                .cloned()
             {
-                let _ = recipient_tx.send(format!("{username}: {message}"));
+                let recipient_message = format!("{username}: {message}");
+                let _ = recipient_tx.send(recipient_message.clone());
+                let _ = tx.send(recipient_message);
             } else {
-                // Send to general chat
-                let _ = state_clone.tx.send(format!("{username}: {message}"));
+                let _ = tx.send(format!("Recipient with username \"{recipient}\" not found"));
             }
         }
     });
@@ -119,9 +138,22 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>) {
 
     let msg = format!("{username_clone} left.");
     tracing::debug!("{msg}");
-    let _ = state.tx.send(msg); // Send leave message to general chat
+    let _ = state.tx.send(msg);
 
     state.user_set.lock().unwrap().remove(&username_clone);
+}
+
+fn parse_ws_message(ws_message: String) -> (String, String) {
+    let mut recipient = String::from(constants::GLOBAL);
+    let mut message = ws_message.clone().to_string();
+
+    if ws_message.contains(':') {
+        let mut parts = ws_message.splitn(2, ':');
+        recipient = parts.next().unwrap().trim().to_string();
+        message = parts.next().unwrap().trim().to_string();
+    }
+
+    (recipient, message)
 }
 
 fn check_username(state: &AppState, string: &mut String, name: &str) {
